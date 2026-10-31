@@ -1,0 +1,10 @@
+Amit: Let's begin the sprint retrospective and performance optimization discussion.
+Sneha: The sprint retrospective highlights that build times are taking over 25 minutes.
+Amit: That is significantly slowing down our deployment pipeline and developer feedback loop.
+Sneha: We decided to switch our CI pipelines to GitHub Actions caching.
+Amit: I will configure the workflow caching rules by Wednesday 2 PM.
+Sneha: Someone needs to prune the unused Docker images from the self-hosted runner by Thursday.
+Amit: Agreed, that should free up substantial disk space.
+Sneha: We also need someone to audit the build dependencies and remove deprecated npm packages by Friday.
+Amit: I will document the new CI runner setup in Confluence by Friday 6 PM.
+Sneha: Great, let us make sure those unassigned maintenance tasks get picked up soon.

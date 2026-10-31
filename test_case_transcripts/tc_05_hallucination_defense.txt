@@ -1,0 +1,10 @@
+Manoj: Let's discuss our external API gateway security and certificate maintenance.
+Deepa: Our SSL certificate for the external API gateway expires in exactly two weeks.
+Manoj: We evaluated Let's Encrypt automated certs versus a commercial wildcard certificate.
+Deepa: Let's Encrypt requires updating our ingress cert-manager configuration which takes time.
+Manoj: Let us explore AWS Certificate Manager versus DigiCert next week before deciding.
+Deepa: In the meantime, I will raise the procurement purchase request by 3 PM today.
+Manoj: Someone needs to update the ingress controller secrets before expiration by Wednesday.
+Deepa: Let us check who has write access to the production namespace.
+Manoj: I will verify our alert webhook for certificate expiry by Friday noon.
+Deepa: We will reconvene next Monday to finalize cloud provider options.

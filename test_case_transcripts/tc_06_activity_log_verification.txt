@@ -1,0 +1,10 @@
+Tanvi: Team, let's review the bug reports received from QA over the weekend.
+Rohan: The search autocomplete endpoint is returning 500 errors on special characters.
+Tanvi: It seems like input validation is missing on encoded URI parameters.
+Rohan: We decided to sanitize search strings at the API Gateway level.
+Rohan: I will push the regex sanitization fix by tonight 8 PM.
+Tanvi: We need someone to write unit test cases covering edge cases and SQL injection vectors.
+Rohan: Yes, and someone should notify the mobile app developers about the updated response payloads.
+Tanvi: I will update the API error response documentation by Wednesday noon.
+Rohan: I will deploy the hotfix to the staging environment tomorrow at 10 AM.
+Tanvi: Once deployed, I will run smoke tests across all client endpoints by Thursday 2 PM.

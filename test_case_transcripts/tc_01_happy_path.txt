@@ -1,0 +1,10 @@
+Ravi: Welcome everyone to today's core architecture and sprint alignment sync.
+Priya: Thanks Ravi. Let's start with our database decision from earlier evaluations.
+Ravi: We agreed in today's architecture sync to proceed with PostgreSQL for the database layer.
+Priya: Sounds good. I will update the design document by Monday 5 PM.
+Ravi: I will complete the API testing across all staging endpoints by Friday 3 PM.
+Priya: I will also configure the Prisma ORM schema migrations by Tuesday 4 PM.
+Ravi: Excellent. I will handle the staging database provisioning on AWS RDS by Wednesday noon.
+Priya: That covers the storage layer completely.
+Ravi: I will schedule the follow-up design review with the frontend team for Thursday 11 AM.
+Priya: Perfect, everything is well defined and on track for next sprint.

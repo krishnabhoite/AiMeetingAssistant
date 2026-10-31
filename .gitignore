@@ -1,0 +1,46 @@
+# ==============================================================================
+# SMART STUDY BUDDY - GITIGNORE CONFIGURATION
+# ==============================================================================
+
+# Environment credentials & secret API keys
+.env
+.env.local
+.env.*.local
+*.env
+
+# Python bytecode & cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Vector Store & Relational Database Storage
+chroma_db/
+db/
+*.db
+*.sqlite
+*.sqlite3
+
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints
+
+# IDE & Editor Configurations
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Specific Files
+.DS_Store
+Thumbs.db
+
+# Agent / Tool scratch & system directories

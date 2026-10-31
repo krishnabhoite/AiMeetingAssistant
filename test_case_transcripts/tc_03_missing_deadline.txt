@@ -1,0 +1,10 @@
+Vikram: Thanks for joining today's distributed messaging and streaming sync.
+Kavita: We evaluated Kafka versus RabbitMQ for order event streaming across our services.
+Vikram: RabbitMQ had simpler routing, but Kafka handles our expected event volume better.
+Kavita: The team agreed to standardize on Apache Kafka for higher throughput.
+Vikram: I will draft the topic retention policies by tomorrow morning at 10 AM.
+Kavita: I will prepare the consumer group scaling checklist.
+Vikram: Kavita, when you finish that, I will also implement the dead-letter queue consumer handler.
+Kavita: Sounds like a plan. We also need to decide on the replication factor for production brokers.
+Vikram: I will run benchmark tests on local clusters by Thursday 4 PM.
+Kavita: I will draft the partition key distribution guidelines.
