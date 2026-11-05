@@ -18,6 +18,7 @@
 import os  # Standard Python module for operating system interactions
 from dotenv import load_dotenv  # Loads secret API keys from the .env file
 from graph import build_meeting_graph  # Imports our flowchart builder function from graph.py
+import argparse  # Standard Python module for parsing command-line arguments
 
 # Load environment variables from .env before starting
 load_dotenv()
@@ -49,11 +50,27 @@ def load_transcript(file_path: str) -> str:
         
     return content
 
-SAMPLE_TRANSCRIPT = load_transcript("test_case_transcripts/tc_01_happy_path.txt")
+
+def parse_args():
+    """Parses the transcript file path argument from the command line."""
+    parser = argparse.ArgumentParser(
+        description="Run the Multi-Agent AI Meeting Assistant with a transcript file."
+    )
+    parser.add_argument(
+        "transcript_path",
+        nargs="?",
+        default="test_case_transcripts/tc_01_happy_path.txt",
+        help="Path to the transcript text file (e.g., test_case_transcripts/tc_01_happy_path.txt)"
+    )
+    return parser.parse_args()
 
 def main():
+    args = parse_args()
+    transcript_text = load_transcript(args.transcript_path)
+
     print("\n" + "=" * 65)
     print("Multi-Agent AI Meeting Assistant Starting...")
+    print(f"Loaded Transcript: {args.transcript_path}")
     print("=" * 65)
 
     # Step 1: Build and compile the LangGraph workflow (wires together all nodes and edges)
@@ -63,7 +80,7 @@ def main():
     # We put our `SAMPLE_TRANSCRIPT` into `raw_transcript` and leave all other fields
     # blank/empty so the AI workers can fill them in as the workflow runs.
     initial_state = {
-        "raw_transcript": SAMPLE_TRANSCRIPT,
+        "raw_transcript": transcript_text,
         "indexed_transcript": "",
         "summary": "",
         "decisions": [],
@@ -85,11 +102,17 @@ def main():
     # Every time a single worker (node) finishes its turn, it yields an `event`
     # telling us which node just finished (`node_name`) and what changes it wrote
     # to the clipboard (`node_output`).
-    print("\n--- Real-Time Execution Trace ---")
+    print("\n--- Real-Time Execution Trace (Showing Which Agent Performed Each Task) ---")
     for event in app.stream(initial_state, stream_mode="updates"):
         for node_name, node_output in event.items():
             executed_nodes_sequence.append(node_name)
-            print(f"[*] Running / Completed Node: -> {node_name}")
+            
+            # Display which agent just ran and what task it completed
+            if isinstance(node_output, dict) and node_output.get("activity_log"):
+                for log_entry in node_output["activity_log"]:
+                    print(f"[*] Node '{node_name}' | Agent: [{log_entry.agent_name}] -> {log_entry.action} ({log_entry.details})")
+            else:
+                print(f"[*] Completed Node: -> {node_name}")
             
             # Merge the latest updates from this node into our local copy of `final_state`
             if isinstance(node_output, dict):

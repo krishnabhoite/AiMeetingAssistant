@@ -47,13 +47,13 @@ class ActionItem(BaseModel):
     # if nobody was assigned to the task during the meeting.
     owner: Optional[str] = Field(
         default=None, 
-        description="Name of the person assigned to the task. Null if unspecified or unassigned."
+        description="Name of the person assigned to the task (use speaker name if they say 'I will...'). Null if unassigned or vague like 'someone'."
     )
     
     # When the task is due (or None if no deadline was mentioned in the meeting)
     deadline: Optional[str] = Field(
         default=None, 
-        description="Deadline or expected date/time. Null if unspecified."
+        description="Exact deadline phrase stated in the transcript (e.g., 'Friday', 'Monday 5 PM', 'tonight 8 PM'). Do NOT invent calendar dates. Null if unspecified."
     )
     
     # 'Literal[...]' restricts this field to ONLY one of these three exact phrases.
@@ -91,10 +91,12 @@ class ActionExtractorOutput(BaseModel):
 # The Reviewer AI checks if the other AIs made anything up ("hallucinated").
 # It returns True/False (is_valid) and notes explaining what needs to be fixed.
 class ReviewFeedback(BaseModel):
-    is_valid: bool = Field(description="True if all decisions and tasks strictly match the transcript without hallucinations")
+    is_valid: bool = Field(
+        description="True if all extracted summary claims, decisions, and tasks are supported by the transcript without fabricated owners, dates, or facts."
+    )
     feedback_notes: str = Field(
         default="", 
-        description="Specific instructions or missing/hallucinated items to correct if is_valid is False."
+        description="If is_valid is False, specify only the fabricated/unsupported statements to fix. If is_valid is True, briefly confirm verification."
     )
 
 

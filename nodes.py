@@ -6,10 +6,12 @@
 #   1. Preprocessor Node: Adds line numbers (L01, L02...) to the raw transcript.
 #   2. Summarizer Node: An AI that writes an executive summary & lists decisions.
 #   3. Action Extractor Node: An AI that finds to-do tasks, owners, and deadlines.
-#   4. Human Clarification Node: Pauses and asks a real human (via keyboard input)
-#      to fill in any missing task owners or deadlines.
-#   5. Reviewer Node: A "Fact-Checker" AI that verifies no information was made up.
-#   6. Report Assembler Node: Formats everything into neat tables and saves files.
+#   4. Reviewer Node: A "Fact-Checker" AI that checks summary, decisions, and tasks
+#      against the transcript, flags unsupported statements, and requests corrections.
+#   5. Human Clarification Node: Pauses and asks a real human (via keyboard input)
+#      to fill in any missing task owners or deadlines (or marks them 'Unresolved').
+#   6. Report Assembler Node: Formats everything into neat tables (including the
+#      brief agent activity log) and saves the final report and audit log files.
 #
 # How a Node Works:
 # - INPUT: Every node receives the current `state` (the shared clipboard from state.py).
@@ -34,14 +36,11 @@ from langchain_openai import ChatOpenAI  # LangChain wrapper to talk to OpenAI-c
 from langchain_core.prompts import ChatPromptTemplate  # Tool to build structured instructions (prompts) for the AI
 from tabulate import tabulate  # Formats Python lists into clean, readable Markdown tables
 from datetime import datetime  # Gets the current date and time for timestamps
-from tabulate import tabulate  # (Duplicate import kept to preserve exact original code)
-from state import MeetingState, AgentLog  # Importing our shared state and log blueprints
-
-from state import (
-    MeetingState, 
-    SummarizerOutput, 
-    ActionExtractorOutput, 
-    ReviewFeedback, 
+from state import (  # Importing our shared state and structured data blueprints
+    MeetingState,
+    SummarizerOutput,
+    ActionExtractorOutput,
+    ReviewFeedback,
     AgentLog
 )
 
@@ -55,7 +54,6 @@ load_dotenv()
 # - model="openai/gpt-4o-mini": The specific AI model we are calling.
 # - temperature=0.0: Controls creativity. Setting it to 0.0 makes the AI strictly
 #   factual, consistent, and deterministic (no wild guessing).
-# LLM initialized via OpenRouter
 llm = ChatOpenAI(
     model="openai/gpt-4o-mini",
     openai_api_key=os.getenv("OPENROUTER_API_KEY"),
@@ -67,25 +65,26 @@ llm = ChatOpenAI(
 # ==============================================================================
 # NODE 1: Preprocessor (Line Numbering Worker)
 # ==============================================================================
-# Why do we need this?
-# If we ask an AI to cite where a decision came from, it's much easier and more
-# accurate if every line already has an ID tag like "L01:", "L02:", etc.
-# Notice this node doesn't even use AI—it just uses simple Python text formatting!
+# Why do we need this step?
+# The requirements ask us to reference transcript line numbers for decisions and
+# action items. By tagging every line with "L01:", "L02:", etc. up front, all
+# downstream AI agents can cite exact line numbers accurately.
+# Notice this node doesn't even need AI—it uses simple Python text formatting!
 def preprocessor_node(state: MeetingState) -> dict:
     """Indexes each line of the raw transcript with line numbers (L01, L02, etc.)."""
-    # Split the raw transcript by line breaks, remove extra spaces, and ignore empty lines
+    # Step 1: Split the raw transcript by line breaks, trim extra spaces, and skip empty lines
     lines = [line.strip() for line in state["raw_transcript"].strip().split("\n") if line.strip()]
     
-    # Attach a two-digit line number (L01, L02, L03...) to the front of each line
+    # Step 2: Attach a two-digit line label (L01, L02, L03...) to the front of each line
     indexed_lines = [f"L{idx+1:02d}: {line}" for idx, line in enumerate(lines)]
     
-    # Join all the numbered lines back into one single block of text
+    # Step 3: Join all the numbered lines back into one single block of text
     indexed_transcript = "\n".join(indexed_lines)
     
-    # Return updates to the shared clipboard (MeetingState):
+    # Step 4: Return updates to the shared clipboard (MeetingState):
     # - Save the newly numbered transcript
     # - Reset retry_count to 0
-    # - Add an entry to the activity_log recording that Preprocessor finished its job
+    # - Add an entry to activity_log recording that Preprocessor finished its job
     return {
         "indexed_transcript": indexed_transcript,
         "retry_count": 0,
@@ -93,7 +92,7 @@ def preprocessor_node(state: MeetingState) -> dict:
             AgentLog(
                 agent_name="Preprocessor",
                 action="Index Transcript",
-                details=f"Numbered {len(lines)} lines of text."
+                details=f"Numbered {len(lines)} lines of text (L01 to L{len(lines):02d})."
             )
         ]
     }
@@ -103,40 +102,51 @@ def preprocessor_node(state: MeetingState) -> dict:
 # NODE 2: Summarizer Agent (Summary & Decision Extractor)
 # ==============================================================================
 # This worker reads the numbered transcript and extracts:
-#   1. A high-level executive summary of the meeting.
-#   2. A list of concrete decisions made, along with the line number (e.g., L01).
+#   1. A high-level executive summary of the meeting's main topics and discussion.
+#   2. A list of concrete decisions made, along with the exact line number (e.g., L03).
+# If the Reviewer AI previously flagged an unsupported statement, this node also
+# reads the Reviewer's feedback notes and corrects the summary/decisions.
 def summarizer_node(state: MeetingState) -> dict:
     """Extracts the high-level meeting summary and decisions with line citations."""
-    # Tell the AI that its answer MUST match the 'SummarizerOutput' form from state.py
+    # Step 1: Tell the AI that its answer MUST match the 'SummarizerOutput' form from state.py
     structured_llm = llm.with_structured_output(SummarizerOutput)
     
-    # Create the instructions for the AI:
-    # - "system" message sets the AI's role and rules.
-    # - "user" message provides the actual meeting transcript to analyze.
+    # Step 2: Check if we are re-running this step because the Reviewer AI requested a correction.
+    # If so, attach the Reviewer's feedback notes so the AI fixes the issue.
+    critique_prompt_addition = ""
+    if state.get("review_feedback") and not state["review_feedback"].is_valid:
+        critique_prompt_addition = (
+            f"\nIMPORTANT - PREVIOUS REVIEWER CORRECTION REQUEST TO FIX:\n"
+            f"{state['review_feedback'].feedback_notes}\n"
+        )
+
+    # Step 3: Create the instructions (prompt) for the AI
     prompt = ChatPromptTemplate.from_messages([
         ("system", 
-         "You are a technical meeting summarizer. Given the indexed transcript below, extract:\n"
-         "1. A concise overview of discussion topics and context.\n"
-         "2. A list of concrete decisions made, with the exact line label (e.g., L03) citing the decision.\n"
-         "Do not invent or extrapolate beyond the transcript."),
+         "You are a Technical Meeting Summarizer Agent. Given the indexed transcript below, extract:\n"
+         "1. summary: A concise overview of the meeting's main discussion topics and context.\n"
+         "2. decisions: A list of concrete group decisions or architectural/process agreements made "
+         "(do not list individual to-do tasks as decisions unless they represent a team decision), "
+         "with the exact line label (e.g., L03) where the decision appears.\n"
+         "Do NOT invent or extrapolate anything beyond what is explicitly stated in the transcript.\n"
+         f"{critique_prompt_addition}"),
         ("user", "Indexed Transcript:\n\n{indexed_transcript}")
     ])
     
-    # Connect the prompt template to the structured AI model using LangChain's '|' pipe operator
+    # Step 4: Connect the prompt template to the structured AI model and run it
     chain = prompt | structured_llm
-    
-    # Run the AI chain by passing in the numbered transcript from our shared clipboard
     result: SummarizerOutput = chain.invoke({"indexed_transcript": state["indexed_transcript"]})
     
-    # Save the AI's summary, decisions list, and a log entry back to the shared clipboard
+    # Step 5: Save the AI's summary, decisions list, and activity log entry to the shared clipboard
+    action_label = "Correct Summary & Decisions" if critique_prompt_addition else "Summarize & Extract Decisions"
     return {
         "summary": result.summary,
         "decisions": result.decisions,
         "activity_log": [
             AgentLog(
                 agent_name="SummarizerAgent",
-                action="Summarize & Extract Decisions",
-                details=f"Generated summary and identified {len(result.decisions)} decisions."
+                action=action_label,
+                details=f"Generated summary and identified {len(result.decisions)} key decision(s)."
             )
         ]
     }
@@ -145,171 +155,121 @@ def summarizer_node(state: MeetingState) -> dict:
 # ==============================================================================
 # NODE 3: Action Extractor Agent (To-Do Task Finder)
 # ==============================================================================
-# This worker scans the numbered transcript for tasks that need to be done.
-# For each task, it tries to find WHO is responsible (owner) and WHEN it's due (deadline).
-# If the Reviewer AI previously rejected its work, this node also reads the Reviewer's
-# critique and fixes its mistakes!
+# This worker scans the numbered transcript for action items (tasks to be done).
+# - It reads speaker labels (e.g., "Ravi: I will complete API testing by Friday")
+#   to assign "Ravi" as the owner and "Friday" as the deadline.
+# - It keeps the exact deadline text from the transcript (never inventing calendar dates).
+# - If an owner or deadline is missing or vague (e.g., "someone"), it leaves it
+#   empty (None) and marks `clarification_status` as "Unresolved" so we can ask the user.
 def action_extractor_node(state: MeetingState) -> dict:
     """Extracts action items, capturing task, owner, and deadline, identifying missing data."""
-    # Force the AI to return its output in the 'ActionExtractorOutput' format
+    # Step 1: Force the AI to return its output in the 'ActionExtractorOutput' format
     structured_llm = llm.with_structured_output(ActionExtractorOutput)
     
-    # Check if we are re-running this step because the Reviewer AI found an error earlier.
-    # If so, attach the Reviewer's correction notes to the prompt so the AI learns from its mistake.
+    # Step 2: Check if we are re-running this step because the Reviewer AI requested a correction.
     critique_prompt_addition = ""
     if state.get("review_feedback") and not state["review_feedback"].is_valid:
-        critique_prompt_addition = f"\nPREVIOUS REVIEWER CRITIQUE TO FIX:\n{state['review_feedback'].feedback_notes}\n"
+        critique_prompt_addition = (
+            f"\nIMPORTANT - PREVIOUS REVIEWER CORRECTION REQUEST TO FIX:\n"
+            f"{state['review_feedback'].feedback_notes}\n"
+        )
 
-    # Build the instructions telling the AI how to identify tasks and strictly forbidding guessing
+    # Step 3: Build instructions telling the AI how to identify tasks without guessing
     prompt = ChatPromptTemplate.from_messages([
         ("system", 
-         "You are an Action Item Extraction Agent. Analyze the indexed transcript and identify all explicit or implicit tasks.\n"
-         "For each task:\n"
-         "- Assign a sequential integer id (1, 2, 3...).\n"
-         "- task: Actionable description.\n"
-         "- owner: Person's name responsible for it. Set to null if unassigned or ambiguous (e.g., 'someone').\n"
-         "- deadline: Exact due date/time if stated. Set to null if unspecified.\n"
-         "- line_reference: Exact line label (e.g., L02) where the item appears.\n"
-         "Do NOT guess or fabricate missing owners or deadlines. Leave them as null.\n"
+         "You are an Action Item Extraction Agent. Analyze the indexed transcript and identify all action items (tasks).\n"
+         "For each action item:\n"
+         "- id: Assign a sequential integer id (1, 2, 3...).\n"
+         "- task: Clear, concise description of the task to be performed.\n"
+         "- owner: Use the speaker's name if they commit to the task (e.g., 'Ravi: I will test the API' -> owner='Ravi'). "
+         "Set to null (None) if unassigned or vague (e.g., 'someone needs to...').\n"
+         "- deadline: Copy the EXACT deadline phrase stated in the transcript (e.g., 'Friday', 'Monday 5 PM', 'tonight 8 PM', 'Wednesday noon'). "
+         "NEVER convert relative days into invented calendar/ISO dates (do NOT output dates like '2023-10-02'). "
+         "Set to null (None) if no deadline is mentioned.\n"
+         "- line_reference: Exact line label (e.g., L02) where the task appears.\n"
+         "Do NOT guess or fabricate missing owners or deadlines. Leave missing values as null.\n"
          f"{critique_prompt_addition}"),
         ("user", "Indexed Transcript:\n\n{indexed_transcript}")
     ])
     
-    # Connect the prompt to the AI and run it
+    # Step 4: Connect the prompt to the AI and run it
     chain = prompt | structured_llm
     result: ActionExtractorOutput = chain.invoke({"indexed_transcript": state["indexed_transcript"]})
     
-    # Tag initial clarification needs:
-    # Loop through each extracted task. If either the owner or deadline is missing,
-    # mark 'clarification_status' as "Unresolved" so we know to ask a human later.
+    # Step 5: Tag initial clarification status for each extracted action item.
+    # If either owner or deadline is missing, mark 'clarification_status' as "Unresolved"
+    # so the workflow knows to ask the human user for clarification.
     for item in result.action_items:
-        if not item.owner or not item.deadline:
+        has_owner = bool(item.owner and item.owner.strip().lower() not in ["none", "null", "unassigned", "unresolved"])
+        has_deadline = bool(item.deadline and item.deadline.strip().lower() not in ["none", "null", "unspecified", "unresolved"])
+        
+        if not has_owner:
+            item.owner = None
+        if not has_deadline:
+            item.deadline = None
+            
+        if not has_owner or not has_deadline:
             item.clarification_status = "Unresolved"
         else:
             item.clarification_status = "Not Needed"
             
-    # Write the extracted action items and log entry back to the shared clipboard
+    # Step 6: Write the extracted action items and log entry back to the shared clipboard
+    action_label = "Correct Action Items" if critique_prompt_addition else "Extract Action Items"
     return {
         "action_items": result.action_items,
         "activity_log": [
             AgentLog(
                 agent_name="ActionExtractorAgent",
-                action="Extract Action Items",
-                details=f"Extracted {len(result.action_items)} action items."
+                action=action_label,
+                details=f"Extracted {len(result.action_items)} action item(s)."
             )
         ]
     }
 
 
 # ==============================================================================
-# NODE 4: Human-in-the-Loop Clarification (Interactive Q&A with User)
+# NODE 4: Reviewer Agent (Quality Control & Fact-Checker)
 # ==============================================================================
-# Sometimes meetings are vague (e.g., "Someone should review security").
-# Instead of letting the AI guess, this node pauses the program and prompts the
-# human user in the terminal (`input(...)`) to type in the missing owner or deadline.
-def human_clarification_node(state: MeetingState) -> dict:
-    """CLI-based human-in-the-loop prompt to clarify unassigned tasks or missing deadlines."""
-    updated_items = []
-    logs = []
-    
-    print("\n" + "="*60)
-    print(" [HUMAN-IN-THE-LOOP] Missing Information Detected")
-    print("="*60)
-    
-    # Check every action item to see if it is missing an owner or a deadline
-    for item in state["action_items"]:
-        needs_owner = not item.owner or item.owner.strip().lower() in ["none", "null", "unassigned"]
-        needs_deadline = not item.deadline or item.deadline.strip().lower() in ["none", "null", "unspecified"]
-        
-        # If either owner or deadline is missing, ask the user in the terminal
-        if needs_owner or needs_deadline:
-            print(f"\nTask ID {item.id}: '{item.task}' (From line: {item.line_reference})")
-            
-            # Ask human for the missing owner
-            new_owner = item.owner
-            if needs_owner:
-                val = input("  -> Assignee is missing. Enter owner (Leave blank to keep unresolved): ").strip()
-                if val:
-                    new_owner = val
-            
-            # Ask human for the missing deadline
-            new_deadline = item.deadline
-            if needs_deadline:
-                val = input("  -> Deadline is missing. Enter deadline (Leave blank to keep unresolved): ").strip()
-                if val:
-                    new_deadline = val
-            
-            # Update resolution status:
-            # If the human left any required question blank, it remains "Unresolved".
-            # If the human provided the missing details, mark it as "Resolved"!
-            if (needs_owner and not new_owner) or (needs_deadline and not new_deadline):
-                item.clarification_status = "Unresolved"
-            else:
-                item.clarification_status = "Resolved"
-                
-            # Default to "Unassigned" or "Unspecified" for clean display if left blank
-            item.owner = new_owner if new_owner else "Unassigned"
-            item.deadline = new_deadline if new_deadline else "Unspecified"
-            
-            # Record what the human answered in the audit log
-            logs.append(AgentLog(
-                agent_name="HumanClarification",
-                action="Resolve Ambiguity",
-                details=f"Task {item.id} -> Owner: '{item.owner}', Deadline: '{item.deadline}', Status: {item.clarification_status}"
-            ))
-        else:
-            # Both owner and deadline were already present in the transcript
-            item.clarification_status = "Not Needed"
-            
-        updated_items.append(item)
-        
-    print("="*60 + "\n")
-    
-    # Save the updated action items and human clarification logs back to the shared clipboard
-    return {
-        "action_items": updated_items,
-        "activity_log": logs
-    }
-
-
-# ==============================================================================
-# NODE 5: Reviewer Agent (Quality Control & Fact-Checker)
-# ==============================================================================
-# This AI acts like a strict auditor. It compares the original numbered transcript
-# against the extracted summary, decisions, and action items to make sure nothing
-# was hallucinated (made up) or misquoted.
+# This AI acts like a strict auditor BEFORE we present or ask the user for final
+# inputs. It compares the numbered transcript against the AI-extracted summary,
+# decisions, and action items to make sure nothing was hallucinated (made up).
+# - If it finds any unsupported statement, it flags it (is_valid=False) and writes
+#   specific correction instructions in `feedback_notes`.
 def reviewer_node(state: MeetingState) -> dict:
-    """Verifies that all extracted summary items, decisions, and tasks match transcript facts."""
-    # Force the AI to output a 'ReviewFeedback' object (is_valid: True/False + feedback_notes)
+    """Checks the summary, decisions, and action items against the transcript, flags unsupported statements, and requests corrections."""
+    # Step 1: Force the AI to output a 'ReviewFeedback' object (is_valid: True/False + feedback_notes)
     structured_llm = llm.with_structured_output(ReviewFeedback)
     
-    # Track how many times we have run the review check so far
+    # Step 2: Track how many review passes have run so far (used to cap correction to 1 pass)
     current_retry = state.get("retry_count", 0)
     
-    # Format the decisions and action items into readable text lists for the Reviewer AI to inspect
-    decisions_text = "\n".join([f"- [{d.line_reference}] {d.decision}" for d in state["decisions"]])
+    # Step 3: Format the decisions and action items into readable text lists for the Reviewer AI
+    decisions_text = "\n".join([f"- [{d.line_reference}] {d.decision}" for d in state["decisions"]]) or "None"
     actions_text = "\n".join([
-        f"- ID {a.id}: Task='{a.task}', Owner='{a.owner}', Deadline='{a.deadline}', Ref='{a.line_reference}'" 
+        f"- ID {a.id}: Task='{a.task}', Owner='{a.owner}', Deadline='{a.deadline}', "
+        f"ClarificationStatus='{a.clarification_status}', Ref='{a.line_reference}'" 
         for a in state["action_items"]
-    ])
+    ]) or "None"
     
-    # Build the fact-checking prompt with strict validation rules
+    # Step 4: Build the fact-checking prompt with clear validation rules
     prompt = ChatPromptTemplate.from_messages([
         ("system",
-         "You are a Quality & Verification Reviewer Agent. Fact-check the extracted meeting data against the transcript.\n"
-         "Validation Rules:\n"
-         "1. Every cited line reference must accurately contain the claimed decision or task.\n"
-         "2. No owners or deadlines should be fabricated (unless marked as human-resolved).\n"
-         "3. If any decision or task completely misrepresents the text, mark is_valid=False and specify precise feedback.\n"
-         "4. If all items are supported by the transcript, mark is_valid=True."),
+         "You are a Quality & Verification Reviewer Agent. Fact-check the extracted summary, decisions, and action items against the transcript.\n"
+         "CRITICAL VALIDATION RULES:\n"
+         "1. Summary check: The summary is a concise overview; do NOT mark is_valid=False just because it omits minor details. Only flag the summary if it makes a false claim that contradicts the transcript.\n"
+         "2. 'Someone' = Unassigned (Owner MUST be 'None'): If a speaker says 'We need someone to...' or 'Someone should...' (e.g., 'Rohan: someone should notify...'), the task is UNASSIGNED. Owner MUST be 'None' (not the speaker!). Having Owner='None' or Deadline='None' is 100% VALID because a downstream Human Clarification node will ask the user.\n"
+         "3. Direct commitment ('I will...'): If a speaker says 'Name: I will do X', then Owner='Name' is VALID.\n"
+         "4. Line references: Every cited line reference (e.g., L04) must match the line where that decision or task appears.\n"
+         "5. When to set is_valid=False: ONLY set is_valid=False if an item is fabricated/hallucinated, if a 'someone' task was wrongly given an owner instead of 'None', if an invented calendar date (like '2023-10-02') was used, or if a line reference is wrong.\n"
+         "6. Otherwise, set is_valid=True and state 'All extracted summary points, decisions, and action items are supported by the transcript.'"),
         ("user",
-         "ORIGINAL TRANSCRIPT:\n{indexed_transcript}\n\n"
+         "ORIGINAL INDEXED TRANSCRIPT:\n{indexed_transcript}\n\n"
          "EXTRACTED SUMMARY:\n{summary}\n\n"
-         "DECISIONS:\n{decisions_text}\n\n"
-         "ACTION ITEMS:\n{actions_text}")
+         "EXTRACTED DECISIONS:\n{decisions_text}\n\n"
+         "EXTRACTED ACTION ITEMS:\n{actions_text}")
     ])
     
-    # Connect prompt and AI model, then run the fact-check
+    # Step 5: Connect prompt and AI model, then run the fact-check
     chain = prompt | structured_llm
     feedback: ReviewFeedback = chain.invoke({
         "indexed_transcript": state["indexed_transcript"],
@@ -318,7 +278,8 @@ def reviewer_node(state: MeetingState) -> dict:
         "actions_text": actions_text
     })
     
-    # Save the Reviewer's verdict, increment the retry counter by 1, and log the review outcome
+    # Step 6: Save the Reviewer's verdict, update retry_count, and log the review outcome
+    note_summary = feedback.feedback_notes if feedback.feedback_notes else ("All statements verified against transcript." if feedback.is_valid else "Unsupported statements flagged for correction.")
     return {
         "review_feedback": feedback,
         "retry_count": current_retry + 1,
@@ -326,78 +287,181 @@ def reviewer_node(state: MeetingState) -> dict:
             AgentLog(
                 agent_name="ReviewerAgent",
                 action="Fact Check & Verification",
-                details=f"Review Pass {current_retry + 1}: Valid={feedback.is_valid}. Notes: {feedback.feedback_notes or 'None'}"
+                details=f"Valid={feedback.is_valid}. Notes: {note_summary}"
             )
         ]
     }
 
 
 # ==============================================================================
+# NODE 5: Human-in-the-Loop Clarification (Interactive Q&A with User)
+# ==============================================================================
+# Requirement from specification:
+# "When an action item has no clear owner or deadline, ask the user for clarification
+#  rather than inventing information. Incorporate the response into the report.
+#  If the user cannot clarify, mark the field as unresolved."
+def human_clarification_node(state: MeetingState) -> dict:
+    """CLI-based human-in-the-loop prompt to clarify unassigned tasks or missing deadlines."""
+    updated_items = []
+    logs = []
+    
+    print("\n" + "=" * 65)
+    print(" [HUMAN-IN-THE-LOOP] Missing Information Detected")
+    print(" Please provide missing details below (or press Enter to leave Unresolved).")
+    print("=" * 65)
+    
+    # Step 1: Loop through every action item and check if owner or deadline is missing
+    for item in state["action_items"]:
+        needs_owner = not item.owner or item.owner.strip().lower() in ["none", "null", "unassigned", "unresolved"]
+        needs_deadline = not item.deadline or item.deadline.strip().lower() in ["none", "null", "unspecified", "unresolved"]
+        
+        # Step 2: If either owner or deadline is missing, ask the user in the terminal
+        if needs_owner or needs_deadline:
+            print(f"\nTask ID {item.id}: '{item.task}' (Transcript Ref: {item.line_reference})")
+            
+            # Ask human for the missing owner
+            new_owner = item.owner
+            if needs_owner:
+                val = input("  -> Owner is missing. Enter owner name (or press Enter to mark as Unresolved): ").strip()
+                new_owner = val if val else None
+            
+            # Ask human for the missing deadline
+            new_deadline = item.deadline
+            if needs_deadline:
+                val = input("  -> Deadline is missing. Enter deadline (or press Enter to mark as Unresolved): ").strip()
+                new_deadline = val if val else None
+            
+            # Step 3: Update the task fields and clarification status based on the user's answer:
+            # - If the user left any missing field blank, mark that field as "Unresolved"
+            #   and set clarification_status = "Unresolved".
+            # - If the user answered all missing fields for this task, set clarification_status = "Resolved".
+            if (needs_owner and not new_owner) or (needs_deadline and not new_deadline):
+                item.clarification_status = "Unresolved"
+            else:
+                item.clarification_status = "Resolved"
+                
+            item.owner = new_owner if new_owner else "Unresolved"
+            item.deadline = new_deadline if new_deadline else "Unresolved"
+            
+            # Step 4: Record what the human answered in the audit log
+            logs.append(AgentLog(
+                agent_name="HumanClarification",
+                action="Ask User for Clarification",
+                details=f"Task {item.id} ({item.line_reference}) -> Owner: '{item.owner}', Deadline: '{item.deadline}', Status: {item.clarification_status}"
+            ))
+        else:
+            # Both owner and deadline were already clearly stated in the transcript
+            item.clarification_status = "Not Needed"
+            
+        updated_items.append(item)
+        
+    print("=" * 65 + "\n")
+    
+    # Step 5: Save the updated action items and human clarification logs to the shared clipboard
+    return {
+        "action_items": updated_items,
+        "activity_log": logs
+    }
+
+
+# ==============================================================================
 # NODE 6: Report Assembler (Final Publisher)
 # ==============================================================================
-# Once everything is verified, this final worker takes all the data from the shared
-# clipboard, formats it into clean Markdown tables, and saves two files to disk:
-#   1. `meeting_report.md` (The polished meeting summary, decisions, and tasks)
-#   2. `agent_activity_log.txt` (A step-by-step audit trail of what every agent did)
+# Requirement from specification:
+# "Expected Output: Produce a meeting summary, a list of decisions, an action-item
+#  table containing tasks, owners, deadlines, and clarification status, and a brief
+#  agent activity log."
+#
+# This final worker takes all verified data from the shared clipboard, formats it
+# into clean Markdown sections and tables, and writes:
+#   1. `meeting_report.md` (The complete reviewed meeting report including the brief activity log)
+#   2. `agent_activity_log.txt` (A standalone audit log file)
 def report_assembler_node(state: MeetingState) -> dict:
-    """Assembles deliverables, prints them, and writes:
-       - meeting_report.md (Summary, Decisions, Action Items)
-       - agent_activity_log.txt (Chronological agent telemetry)
-    """
-    # Get current date & time string (e.g., "2026-10-31 20:00:00")
+    """Assembles the final reviewed meeting report and writes meeting_report.md and agent_activity_log.txt."""
+    # Step 1: Get current date & time string for the report header
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # ---------------------------------------------------------
-    # 1. Build the Meeting Report (Deliverable 1)
-    # ---------------------------------------------------------
+    # Step 2: Build Section 1 - Executive Summary
     summary_section = f"## 1. Executive Summary\n{state['summary']}\n"
     
-    # Convert decisions list into a GitHub-flavored Markdown table using 'tabulate'
+    # Step 3: Build Section 2 - Key Decisions (with transcript line references)
     decisions_data = [[d.line_reference, d.decision] for d in state["decisions"]]
     decisions_table = tabulate(decisions_data, headers=["Line Ref", "Decision"], tablefmt="github")
     decisions_section = f"## 2. Key Decisions\n{decisions_table}\n"
     
-    # Convert action items list into a GitHub-flavored Markdown table
+    # Step 4: Build Section 3 - Action Items Table
+    # Contains: ID, Task Description, Owner, Deadline, Clarification Status, and Line Reference
     action_data = [
-        [a.id, a.task, a.owner or "Unassigned", a.deadline or "Unspecified", a.clarification_status, a.line_reference]
+        [
+            a.id,
+            a.task,
+            a.owner if a.owner else "Unresolved",
+            a.deadline if a.deadline else "Unresolved",
+            a.clarification_status,
+            a.line_reference
+        ]
         for a in state["action_items"]
     ]
     actions_table = tabulate(
         action_data, 
-        headers=["ID", "Task Description", "Owner", "Deadline", "Clarification Status", "Reference"], 
+        headers=["ID", "Task Description", "Owner", "Deadline", "Clarification Status", "Line Ref"], 
         tablefmt="github"
     )
     actions_section = f"## 3. Action Items\n{actions_table}\n"
+
+    # Step 5: Build Section 4 - Review & Fact-Check Summary
+    feedback = state.get("review_feedback")
+    if feedback:
+        review_status = "Verified (All statements supported by transcript)" if feedback.is_valid else "Flagged (Corrections requested)"
+        review_notes = feedback.feedback_notes or "All extracted summary points, decisions, and action items match the transcript."
+    else:
+        review_status = "Not Run"
+        review_notes = "N/A"
+    review_section = (
+        f"## 4. Review & Verification Summary\n"
+        f"- **Verification Status:** {review_status}\n"
+        f"- **Reviewer Notes:** {review_notes}\n"
+    )
+
+    # Step 6: Build Section 5 - Brief Agent Activity Log
+    # Append this final ReportAssembler step to the list of logs collected so far
+    final_log_entry = AgentLog(
+        agent_name="ReportAssembler",
+        action="Assemble & Export Final Report",
+        details="Generated reviewed meeting report (meeting_report.md) and activity log (agent_activity_log.txt)."
+    )
+    current_logs = state["activity_log"] + [final_log_entry]
+
+    activity_table_data = [
+        [idx + 1, log.agent_name, log.action, log.details]
+        for idx, log in enumerate(current_logs)
+    ]
+    activity_table = tabulate(
+        activity_table_data,
+        headers=["Step", "Agent Name", "Task Performed", "Details"],
+        tablefmt="github"
+    )
+    activity_section = f"## 5. Brief Agent Activity Log\n{activity_table}\n"
     
-    # Combine all sections into the final Markdown document string
+    # Step 7: Combine all 5 sections into the final Markdown report
     meeting_report_content = (
-        f"# Meeting Review Report\n"
+        f"# Reviewed Meeting Report\n"
         f"*Generated on: {timestamp}*\n\n"
         f"{summary_section}\n"
         f"{decisions_section}\n"
-        f"{actions_section}"
+        f"{actions_section}\n"
+        f"{review_section}\n"
+        f"{activity_section}"
     )
 
-    # Write meeting_report.md to the project folder
+    # Step 8: Save `meeting_report.md` to disk
     with open("meeting_report.md", "w", encoding="utf-8") as f:
         f.write(meeting_report_content)
 
-    # ---------------------------------------------------------
-    # 2. Build the Agent Activity Log File (Deliverable 2)
-    # ---------------------------------------------------------
-    # Append this final assembly step to the list of logs collected so far
-    current_logs = state["activity_log"] + [
-        AgentLog(
-            agent_name="ReportAssembler",
-            action="Assemble & Export",
-            details="Exported meeting_report.md and generated agent_activity_log.txt"
-        )
-    ]
-
-    # Format each log item into a readable text block
+    # Step 9: Format and save `agent_activity_log.txt` to disk as a standalone text log
     log_entries = [
-        f"[{timestamp}] [{log.agent_name}] -> {log.action}\n    Details: {log.details}"
-        for log in current_logs
+        f"[Step {idx + 1}] [{timestamp}] [{log.agent_name}] -> {log.action}\n    Details: {log.details}"
+        for idx, log in enumerate(current_logs)
     ]
     log_file_content = (
         f"======================================================================\n"
@@ -409,7 +473,6 @@ def report_assembler_node(state: MeetingState) -> dict:
         + "\n\n========================= END OF AUDIT LOG =========================\n"
     )
 
-    # Write agent_activity_log.txt to the project folder
     with open("agent_activity_log.txt", "w", encoding="utf-8") as f:
         f.write(log_file_content)
 
@@ -417,14 +480,8 @@ def report_assembler_node(state: MeetingState) -> dict:
     print(" -> File saved: meeting_report.md")
     print(" -> File saved: agent_activity_log.txt")
 
-    # Save the final report string and final log entry to the shared clipboard
+    # Step 10: Return the final report string and final log entry to the shared clipboard
     return {
         "final_report": meeting_report_content,
-        "activity_log": [
-            AgentLog(
-                agent_name="ReportAssembler",
-                action="Assemble & Export",
-                details="Exported meeting_report.md and agent_activity_log.txt"
-            )
-        ]
+        "activity_log": [final_log_entry]
     }

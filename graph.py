@@ -5,21 +5,22 @@
 # workers, then `graph.py` is the **Factory Floor Map** (powered by LangGraph)
 # that defines the exact order in which the workers do their jobs.
 #
-# Key LangGraph Concepts Explained for a Layman:
-# 1. `StateGraph`: A flowchart builder. It manages our shared clipboard (`MeetingState`)
-#    and passes it from worker to worker.
-# 2. `Nodes` (`add_node`): The stations/stops on our flowchart (the functions from `nodes.py`).
-# 3. `Normal Edges` (`add_edge`): Fixed one-way arrows between stations.
-#    For example: "After `preprocessor` finishes, ALWAYS go to `summarizer`."
-# 4. `Conditional Edges` (`add_conditional_edges`): Decision forks in the road!
-#    Instead of always going to the same next step, a small routing function
-#    checks the clipboard and decides which way to go next:
-#    - Fork 1 (`route_clarification`): Are any task owners or deadlines missing?
-#      If YES -> detour to `human_clarification`. If NO -> go straight to `reviewer`.
-#    - Fork 2 (`route_review_feedback`): Did the `reviewer` find mistakes?
-#      If YES (and retries < 2) -> loop back to `action_extractor` to try again.
-#      If NO (approved) -> proceed to `report_assembler`.
-# 5. `END`: A special built-in marker that tells LangGraph the workflow is finished.
+# How the Workflow Runs Step-by-Step:
+#   1. `preprocessor`: Numbers each line of the transcript (L01, L02...).
+#   2. `summarizer`: Summarizes the discussion and extracts key decisions.
+#   3. `action_extractor`: Extracts action items, owners, and deadlines.
+#   4. `reviewer`: Checks the summary, decisions, and action items against the
+#      transcript. Flags any unsupported statements and requests corrections.
+#   5. Decision Fork (`route_after_review`):
+#      - If the Reviewer found unsupported statements AND we haven't done a
+#        correction pass yet (retry_count == 1), route back ONCE to `summarizer`
+#        -> `action_extractor` to fix the mistakes before asking the human.
+#      - Once verified (or after the single correction pass), check if any
+#        action item is missing an owner or deadline:
+#        * If YES -> go to `human_clarification` to ask the user (only ONCE!).
+#        * If NO  -> go straight to `report_assembler`.
+#   6. `report_assembler`: Formats and exports the final reviewed report and
+#      agent activity log, then finishes at `END`.
 # ==============================================================================
 
 from typing import Literal  # Restricts function return types to specific exact strings
@@ -29,111 +30,98 @@ from nodes import (  # Import all 6 worker functions from nodes.py
     preprocessor_node,
     summarizer_node,
     action_extractor_node,
-    human_clarification_node,
     reviewer_node,
+    human_clarification_node,
     report_assembler_node
 )
 
 
 # ------------------------------------------------------------------------------
-# Decision Fork 1: Should we ask a human for help, or go straight to review?
+# Decision Fork: What happens after the Reviewer finishes checking the AI's work?
 # ------------------------------------------------------------------------------
-# After the `action_extractor` finishes finding tasks, LangGraph runs this function
-# to decide which node to visit next.
-def route_clarification(state: MeetingState) -> Literal["human_clarification", "reviewer"]:
-    """Routes to human clarification if any action item has an unresolved owner or deadline."""
-    # Loop through all extracted tasks on the clipboard
-    for item in state.get("action_items", []):
-        needs_owner = not item.owner or item.owner.strip().lower() in ["none", "null", "unassigned"]
-        needs_deadline = not item.deadline or item.deadline.strip().lower() in ["none", "null", "unspecified"]
-        
-        # If even ONE task is missing an owner or deadline, detour to the human clarification step
-        if needs_owner or needs_deadline:
-            return "human_clarification"
-            
-    # Otherwise, if everything is already clear, skip the human prompt and go straight to the Reviewer AI
-    return "reviewer"
-
-
-# ------------------------------------------------------------------------------
-# Decision Fork 2: Did the Reviewer approve the work, or do we need a redo?
-# ------------------------------------------------------------------------------
-# After the `reviewer` finishes fact-checking, LangGraph runs this function
-# to decide whether to loop back for corrections or move forward to build the report.
-def route_review_feedback(state: MeetingState) -> Literal["action_extractor", "report_assembler"]:
-    """Allows at most 2 retry loops if reviewer finds discrepancies; otherwise proceeds to assembly."""
+def route_after_review(
+    state: MeetingState
+) -> Literal["summarizer", "human_clarification", "report_assembler"]:
+    """
+    Decides the next step after the Reviewer node:
+    1. If Reviewer found unsupported statements on the first pass (retry_count == 1),
+       route back ONCE to 'summarizer' -> 'action_extractor' for correction.
+    2. Otherwise, if any action item is missing an owner or deadline, route to
+       'human_clarification' to ask the user.
+    3. Otherwise, proceed directly to 'report_assembler'.
+    """
     feedback = state.get("review_feedback")
     retry_count = state.get("retry_count", 0)
-    
-    # Case 1: Approved by reviewer (no hallucinations or errors found) -> Move to final report assembly!
-    if feedback and feedback.is_valid:
-        return "report_assembler"
-    
-    # Case 2: Loop limit guard (capped at 2 retries)
-    # Even if the Reviewer isn't happy, we stop looping after 2 attempts so the program
-    # never gets stuck in an infinite loop burning API credits.
-    if retry_count >= 2:
-        print(f"\n[Notice] Reached maximum correction retries ({retry_count}). Proceeding to assembly.")
-        return "report_assembler"
-    
-    # Case 3: Reviewer found an error and we still have retries left -> Send back to action_extractor!
-    print(f"\n[Notice] Discrepancy detected by Reviewer (Retry {retry_count}/2). Routing back for corrections.")
-    return "action_extractor"
+
+    # Case 1: The Reviewer flagged unsupported statements and we haven't done our
+    # single correction pass yet (retry_count == 1). Route back once to fix them!
+    if feedback and not feedback.is_valid and retry_count <= 1:
+        print(
+            f"\n[Review Notice] Unsupported statement flagged by Reviewer. "
+            f"Running 1 correction pass before final report..."
+        )
+        return "summarizer"
+
+    # Case 2: Review is complete! Now check if any task has a missing owner or deadline
+    # so we can ask the human user for clarification (at most once).
+    for item in state.get("action_items", []):
+        needs_owner = not item.owner or item.owner.strip().lower() in ["none", "null", "unassigned", "unresolved"]
+        needs_deadline = not item.deadline or item.deadline.strip().lower() in ["none", "null", "unspecified", "unresolved"]
+
+        # If even ONE task is missing an owner or deadline, detour to Human Clarification
+        if needs_owner or needs_deadline:
+            return "human_clarification"
+
+    # Case 3: Everything is verified and all tasks have owners and deadlines -> Assemble Report!
+    return "report_assembler"
 
 
 # ------------------------------------------------------------------------------
 # Graph Builder: Wiring the Flowchart Together
 # ------------------------------------------------------------------------------
 def build_meeting_graph():
-    """Builds and compiles the StateGraph workflow."""
-    # 1. Create a new blank flowchart that uses `MeetingState` as its shared clipboard
+    """Builds and compiles the LangGraph multi-agent workflow."""
+    # Step 1: Create a new blank flowchart that uses `MeetingState` as its shared clipboard
     workflow = StateGraph(MeetingState)
     
-    # 2. Register Nodes (Add all 6 worker stations to the flowchart and give each a name)
+    # Step 2: Register all 6 worker stations (nodes) on the flowchart
     workflow.add_node("preprocessor", preprocessor_node)
     workflow.add_node("summarizer", summarizer_node)
     workflow.add_node("action_extractor", action_extractor_node)
-    workflow.add_node("human_clarification", human_clarification_node)
     workflow.add_node("reviewer", reviewer_node)
+    workflow.add_node("human_clarification", human_clarification_node)
     workflow.add_node("report_assembler", report_assembler_node)
     
-    # 3. Define Entry and Sequential Edges (Connect the fixed one-way arrows)
+    # Step 3: Connect the starting station and sequential one-way arrows
     # Start the workflow at 'preprocessor'
     workflow.set_entry_point("preprocessor")
-    # From 'preprocessor', always go to 'summarizer'
+    # After 'preprocessor' numbers the lines, always go to 'summarizer'
     workflow.add_edge("preprocessor", "summarizer")
-    # From 'summarizer', always go to 'action_extractor'
+    # After 'summarizer' writes the summary & decisions, always go to 'action_extractor'
     workflow.add_edge("summarizer", "action_extractor")
+    # After 'action_extractor' finds tasks, always go to 'reviewer' to fact-check against transcript
+    workflow.add_edge("action_extractor", "reviewer")
     
-    # 4. Conditional Branch: Check if any clarification is needed
-    # After 'action_extractor', call `route_clarification` to pick the next stop:
-    # either 'human_clarification' or 'reviewer'.
-    workflow.add_conditional_edges(
-        "action_extractor",
-        route_clarification,
-        {
-            "human_clarification": "human_clarification",
-            "reviewer": "reviewer"
-        }
-    )
-    
-    # After the human finishes answering questions in 'human_clarification', always go to 'reviewer'
-    workflow.add_edge("human_clarification", "reviewer")
-    
-    # 5. Conditional Edge: Review verification loop (capped at 2)
-    # After 'reviewer', call `route_review_feedback` to either loop back to 'action_extractor'
-    # or move ahead to 'report_assembler'.
+    # Step 4: Conditional Branch after 'reviewer'
+    # Calls `route_after_review` to either:
+    # - Run a single correction pass ('summarizer'),
+    # - Ask the user to clarify missing task owners/deadlines ('human_clarification'), or
+    # - Build the final report ('report_assembler').
     workflow.add_conditional_edges(
         "reviewer",
-        route_review_feedback,
+        route_after_review,
         {
-            "action_extractor": "action_extractor",
+            "summarizer": "summarizer",
+            "human_clarification": "human_clarification",
             "report_assembler": "report_assembler"
         }
     )
     
-    # 6. Final Edge: After 'report_assembler' saves the files, mark the workflow as finished (END)
+    # Step 5: After the human answers clarification questions, always go to 'report_assembler'
+    workflow.add_edge("human_clarification", "report_assembler")
+    
+    # Step 6: After 'report_assembler' exports the files, mark the workflow as finished (END)
     workflow.add_edge("report_assembler", END)
     
-    # 7. Compile the flowchart into an executable application and return it
+    # Step 7: Compile the flowchart into a runnable application and return it
     return workflow.compile()
