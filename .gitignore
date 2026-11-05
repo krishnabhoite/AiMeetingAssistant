@@ -3,6 +3,10 @@
 # ==============================================================================
 
 # Environment credentials & secret API keys
+AiMeetingAssistant.code-workspace
+.gitignore
+AI_Meeting_Assistant_Presentation.pptx 
+AiMeetingAssistant.code-workspace
 .env
 .env.local
 .env.*.local
